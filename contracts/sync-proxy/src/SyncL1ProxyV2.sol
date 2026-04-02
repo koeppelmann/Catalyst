@@ -160,7 +160,7 @@ contract SyncL1ProxyV2 {
             address(this)
         );
         bytes memory bridgeData = abi.encodeWithSignature("onMessageInvocation(bytes)", payload);
-        IBridge(bridge).sendMessage(IBridge.Message({
+        (bytes32 outboundMsgHash,) = IBridge(bridge).sendMessage(IBridge.Message({
             id: 0, fee: 0, gasLimit: 2000000,
             from: address(0), srcChainId: 0,
             srcOwner: address(this), destChainId: destChainId,
@@ -185,21 +185,11 @@ contract SyncL1ProxyV2 {
         // Step 4: Reconstruct the expected return message from known fields + claimed data.
         // The return message was sent by L2Receiver via bridge.sendMessage on L2.
         // We know all fields except `id` (provided by builder as returnMsgId).
-        // The return payload contains (callId, success, retData).
-        // Security: the return message hash (verified by proveSignalReceived) includes:
-        //   - 'to' field = address(this) (this proxy) in the Message struct
-        //   - callId = this proxy's nonce in the payload
-        //   - retData = the claimed return value in the payload
-        // All three are part of bridge.hashMessage(). A malicious builder cannot forge
-        // a valid return because it would need a real L2 execution that sent a message
-        // to this exact proxy address with this exact callId — which only happens when
-        // THIS proxy's outbound message is processed on L2.
-        // the return to this specific call. The "to" field is set to this proxy
-        // address, and callId is the proxy's nonce — both are in the hash.
-        // 
+        // The return payload contains (callId, success, retData, outboundMsgHash).
+        // Including outboundMsgHash binds this return to THIS specific outbound request.
         bytes memory returnMsgData = abi.encodeWithSignature(
             "onMessageInvocation(bytes)",
-            abi.encode(callId, success, retData)
+            abi.encode(callId, success, retData, outboundMsgHash)
         );
 
         IBridge.Message memory returnMsg = IBridge.Message({
