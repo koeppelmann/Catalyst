@@ -5,10 +5,6 @@ import {IBridge} from "./IBridge.sol";
 import {L2CallerProxy} from "./L2CallerProxy.sol";
 import {L2CallerProxyFactory} from "./L2CallerProxyFactory.sol";
 
-interface IBridgeContext {
-    function context() external view returns (bytes32 msgHash, address from, uint64 srcChainId);
-}
-
 /// @notice Singleton on L2. Receives L1->L2 bridge messages, routes through caller proxies,
 ///         and bridges return values back to L1.
 contract L2Receiver {
@@ -33,7 +29,7 @@ contract L2Receiver {
 
     function onMessageInvocation(bytes calldata _data) external {
         require(msg.sender == bridge, "only bridge");
-        (bytes32 outboundMsgHash, address srcApp,) = IBridgeContext(bridge).context();
+        bytes32 outboundMsgHash = _contextMsgHash();
 
         (
             address l1Caller,
@@ -42,9 +38,6 @@ contract L2Receiver {
             uint256 callId,
             address resultStoreL1
         ) = abi.decode(_data, (address, address, bytes, uint256, address));
-
-        // Ensure the return is only bridged back to the originating L1 app.
-        require(srcApp == resultStoreL1, "src/result mismatch");
 
         address callerProxy = _getOrDeployProxy(l1Caller);
         (bool success, bytes memory ret) = L2CallerProxy(callerProxy).forward(l2Target, callData);
@@ -90,5 +83,13 @@ contract L2Receiver {
         address predicted = proxyFactory.getAddress(l1Caller, address(this));
         if (predicted.code.length > 0) return predicted;
         return proxyFactory.deploy(l1Caller, address(this));
+    }
+
+    function _contextMsgHash() internal view returns (bytes32 msgHash) {
+        (bool ok, bytes memory ret) = bridge.staticcall(abi.encodeWithSignature("context()"));
+        require(ok && ret.length >= 32, "bridge context unavailable");
+        assembly {
+            msgHash := mload(add(ret, 32))
+        }
     }
 }
