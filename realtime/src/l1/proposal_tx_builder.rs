@@ -115,7 +115,38 @@ impl ProposalTxBuilder {
 
             info!("🔄 SYNC MODE V2: ProofStore with direct return verification");
 
-            let call_id = U256::ZERO;
+            // Read the proxy's current callNonce from L1 state.
+            // The proxy increments callNonce in its fallback, so the callId for this
+            // execution will equal the current nonce value.
+            // Extract proxy address from the first UserOp's execTransaction calldata.
+            let call_id = if let Some(user_op) = batch.user_ops.first() {
+                let (proxy_addr, _) = super::execution_layer::extract_exec_transaction_inner(
+                    user_op.submitter,
+                    &user_op.calldata,
+                );
+                // callNonce() selector = 0x26e263d5 (keccak256("callNonce()")[:4])
+                let nonce_call = alloy::rpc::types::TransactionRequest::default()
+                    .to(proxy_addr)
+                    .input(alloy::primitives::Bytes::from_static(&[0x26, 0xe2, 0x63, 0xd5]).into());
+                match self.provider.call(nonce_call).await {
+                    Ok(result) => {
+                        if result.len() >= 32 {
+                            let nonce = U256::from_be_bytes::<32>(result[..32].try_into().unwrap_or([0u8; 32]));
+                            info!("Read proxy callNonce: {}", nonce);
+                            nonce
+                        } else {
+                            warn!("callNonce returned unexpected length: {}", result.len());
+                            U256::ZERO
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to read proxy callNonce: {}. Defaulting to 0.", e);
+                        U256::ZERO
+                    }
+                }
+            } else {
+                U256::ZERO
+            };
 
             // Check if SYNC_MODE_V2 is set — use ProofStoreV2 (propose + return proof)
             let use_v2 = std::env::var("SYNC_MODE_V2").is_ok();

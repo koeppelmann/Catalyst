@@ -384,7 +384,7 @@ fn extract_bridge_from_call_outputs(frame: &CallFrame) -> Option<(Message, Fixed
 /// If calldata starts with Safe's execTransaction selector (0x6a761202),
 /// extract the inner (to, data) so we can trace the proxy directly.
 /// Otherwise return the original submitter + calldata unchanged.
-fn extract_exec_transaction_inner(submitter: Address, calldata: &Bytes) -> (Address, Bytes) {
+pub fn extract_exec_transaction_inner(submitter: Address, calldata: &Bytes) -> (Address, Bytes) {
     // execTransaction selector = 0x6a761202
     if calldata.len() >= 4 && calldata[..4] == [0x6a, 0x76, 0x12, 0x02] {
         // ABI: execTransaction(address to, uint256 value, bytes data, ...)
