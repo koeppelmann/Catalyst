@@ -59,7 +59,7 @@ impl ProposalTxBuilder {
                     "Build proposeBatch: Failed to estimate gas for blob transaction: {}. Force-sending with 500000 gas.",
                     e
                 );
-                500_000
+                5_000_000
             }
         };
         let tx_blob_gas = tx_blob_gas + tx_blob_gas * self.extra_gas_percentage / 100;
@@ -86,13 +86,6 @@ impl ProposalTxBuilder {
     ) -> Result<TransactionRequest, Error> {
         let mut multicalls: Vec<Multicall::Call> = vec![];
 
-        // Add all user ops to multicall
-        for user_op in &batch.user_ops {
-            let user_op_call = self.build_user_op_call(user_op.clone());
-            info!("Added user op to Multicall: {:?}", &user_op_call);
-            multicalls.push(user_op_call);
-        }
-
         // Build the propose call and blob sidecar
         let (propose_call, blob_sidecar) = self
             .build_propose_call(&batch, contract_addresses.realtime_inbox)
@@ -109,14 +102,151 @@ impl ProposalTxBuilder {
             return Ok(tx);
         }
 
-        info!("Added proposal to Multicall: {:?}", &propose_call);
-        multicalls.push(propose_call.clone());
+        // Check if any user op targets a SyncL1Proxy (has a ProofStore configured).
+        // If so, use the sync multicall structure:
+        //   [ProofStore.store(propose+processMessage), user_ops...]
+        // Otherwise, use the standard structure:
+        //   [user_ops..., propose, l1_calls...]
+        let sync_proof_store = std::env::var("SYNC_PROOF_STORE_ADDRESS").ok();
 
-        // Add all L1 calls
-        for l1_call in &batch.l1_calls {
-            let l1_call_call = self.build_l1_call_call(l1_call.clone(), contract_addresses.bridge);
-            info!("Added L1 call to Multicall: {:?}", &l1_call_call);
-            multicalls.push(l1_call_call);
+        if let Some(proof_store_hex) = sync_proof_store {
+            let proof_store_addr: Address = proof_store_hex.parse()
+                .map_err(|e| Error::msg(format!("Invalid SYNC_PROOF_STORE_ADDRESS: {e}")))?;
+
+            info!("🔄 SYNC MODE V2: ProofStore with direct return verification");
+
+            let call_id = U256::ZERO;
+
+            // Check if SYNC_MODE_V2 is set — use ProofStoreV2 (propose + return proof)
+            let use_v2 = std::env::var("SYNC_MODE_V2").is_ok();
+
+            if use_v2 {
+                // V2: Store propose calldata + return message hash + hop proof
+                // No processMessage needed — proxy verifies return via SignalService directly
+                let (return_msg_id, return_success, return_data, hop_proof) =
+                    if let Some(l1_call) = batch.l1_calls.first() {
+                        let return_msg_id = l1_call.message_from_l2.id;
+                        // Decode the message data to extract the inner return value.
+                        // msg.data = onMessageInvocation(abi.encode(callId, success, retData))
+                        // Layout: 4 (selector) + 32 (offset) + 32 (length) + payload
+                        // payload = abi.encode(uint256 callId, bool success, bytes retData)
+                        let msg_data = l1_call.message_from_l2.data.clone();
+                        let (decoded_success, decoded_ret_data) = {
+                            // Skip onMessageInvocation selector (4) + ABI bytes wrapper (offset 32 + length 32)
+                            if msg_data.len() > 68 {
+                                let inner = &msg_data[68..]; // abi.encode(callId, success, retData, l1Origin)
+                                // callId at [0..32], success at [32..64], retData offset at [64..96], l1Origin at [96..128]
+                                if inner.len() >= 96 {
+                                    let success_word = inner[32..64].iter().any(|&b| b != 0);
+                                    let data_offset = u64::from_be_bytes(
+                                        inner[88..96].try_into().unwrap_or([0u8; 8])
+                                    ) as usize;
+                                    if data_offset < inner.len() && inner.len() >= data_offset + 32 {
+                                        let data_len = u64::from_be_bytes(
+                                            inner[data_offset + 24..data_offset + 32].try_into().unwrap_or([0u8; 8])
+                                        ) as usize;
+                                        let data_start = data_offset + 32;
+                                        if data_start + data_len <= inner.len() {
+                                            (success_word, Bytes::copy_from_slice(&inner[data_start..data_start + data_len]))
+                                        } else {
+                                            tracing::warn!("Return data decode failed: data slice out of bounds");
+                                            (false, Bytes::new())
+                                        }
+                                    } else {
+                                        tracing::warn!("Return data decode failed: invalid data offset");
+                                        (false, Bytes::new())
+                                    }
+                                } else {
+                                    tracing::warn!("Return data decode failed: inner payload too short ({})", msg_data.len());
+                                    (false, Bytes::new())
+                                }
+                            } else {
+                                tracing::warn!("Return data decode failed: msg_data too short ({})", msg_data.len());
+                                (false, Bytes::new())
+                            }
+                        };
+                        tracing::info!(
+                            "Decoded return: success={}, data_len={}",
+                            decoded_success,
+                            decoded_ret_data.len()
+                        );
+                        (
+                            return_msg_id,
+                            decoded_success,
+                            decoded_ret_data,
+                            l1_call.signal_slot_proof.clone(),
+                        )
+                    } else {
+                        (0u64, false, Bytes::new(), Bytes::new())
+                    };
+
+                let store_calldata = alloy::sol_types::SolCall::abi_encode(&ProofStoreV2Store {
+                    callId: call_id,
+                    proposeTarget: contract_addresses.realtime_inbox,
+                    proposeCalldata: propose_call.data.clone(),
+                    returnMsgId: return_msg_id,
+                    returnSuccess: return_success,
+                    returnData: return_data,
+                    hopProof: hop_proof,
+                });
+
+                multicalls.push(Multicall::Call {
+                    target: proof_store_addr,
+                    value: U256::ZERO,
+                    data: Bytes::from(store_calldata),
+                });
+                info!("Added ProofStoreV2.store() to Multicall (V2 sync mode, no processMessage)");
+            } else {
+                // V1: Store propose + processMessage calldata
+                let process_message_calls: Vec<Multicall::Call> = batch.l1_calls.iter()
+                    .map(|l1_call| self.build_l1_call_call(l1_call.clone(), contract_addresses.bridge))
+                    .collect();
+
+                let process_msg_data = if let Some(first_l1_call) = process_message_calls.first() {
+                    first_l1_call.data.clone()
+                } else {
+                    Bytes::new()
+                };
+
+                let store_calldata = alloy::sol_types::SolCall::abi_encode(&ProofStoreStore {
+                    callId: call_id,
+                    proposeTarget: contract_addresses.realtime_inbox,
+                    proposeCalldata: propose_call.data.clone(),
+                    processMessageTarget: contract_addresses.bridge,
+                    processMessageCalldata: process_msg_data,
+                });
+
+                multicalls.push(Multicall::Call {
+                    target: proof_store_addr,
+                    value: U256::ZERO,
+                    data: Bytes::from(store_calldata),
+                });
+                info!("Added ProofStore.store() to Multicall (V1 sync mode)");
+            }
+
+            // Then add user ops
+            for user_op in &batch.user_ops {
+                let user_op_call = self.build_user_op_call(user_op.clone());
+                info!("Added user op to Multicall: {:?}", &user_op_call);
+                multicalls.push(user_op_call);
+            }
+        } else {
+            // Standard (async) mode: [user_ops..., propose, l1_calls...]
+            for user_op in &batch.user_ops {
+                let user_op_call = self.build_user_op_call(user_op.clone());
+                info!("Added user op to Multicall: {:?}", &user_op_call);
+                multicalls.push(user_op_call);
+            }
+
+            info!("Added proposal to Multicall: {:?}", &propose_call);
+            multicalls.push(propose_call.clone());
+
+            // Add all L1 calls
+            for l1_call in &batch.l1_calls {
+                let l1_call_call = self.build_l1_call_call(l1_call.clone(), contract_addresses.bridge);
+                info!("Added L1 call to Multicall: {:?}", &l1_call_call);
+                multicalls.push(l1_call_call);
+            }
         }
 
         let multicall = Multicall::new(contract_addresses.proposer_multicall, &self.provider);
@@ -231,3 +361,34 @@ impl ProposalTxBuilder {
         }
     }
 }
+
+// ABI binding for ProofStore V1 store()
+alloy::sol! {
+    #[sol(rpc)]
+    function store(
+        uint256 callId,
+        address proposeTarget,
+        bytes calldata proposeCalldata,
+        address processMessageTarget,
+        bytes calldata processMessageCalldata
+    ) external;
+}
+type ProofStoreStore = storeCall;
+
+// ABI binding for ProofStoreV2.store() — 7-param version
+// Note: function name must be unique in the sol! scope, so we use a module.
+mod proof_store_v2_abi {
+    alloy::sol! {
+        function store(
+            uint256 callId,
+            address proposeTarget,
+            bytes calldata proposeCalldata,
+            uint64 returnMsgId,
+            bool returnSuccess,
+            bytes calldata returnData,
+            bytes calldata hopProof
+        ) external;
+    }
+}
+type ProofStoreV2Store = proof_store_v2_abi::storeCall;
+

@@ -311,7 +311,7 @@ pub trait L2BridgeHandlerOps {
     async fn find_message_and_signal_slot(
         &self,
         block_id: u64,
-    ) -> Result<Option<(Message, FixedBytes<32>)>, anyhow::Error>;
+    ) -> Result<Option<(Message, FixedBytes<32>, FixedBytes<32>)>, anyhow::Error>;
     async fn get_hop_proof(
         &self,
         slot: FixedBytes<32>,
@@ -384,7 +384,7 @@ impl L2BridgeHandlerOps for L2ExecutionLayer {
     async fn find_message_and_signal_slot(
         &self,
         block_id: u64,
-    ) -> Result<Option<(Message, FixedBytes<32>)>, anyhow::Error> {
+    ) -> Result<Option<(Message, FixedBytes<32>, FixedBytes<32>)>, anyhow::Error> {
         use alloy::rpc::types::Filter;
 
         let bridge_address = *self.bridge.address();
@@ -441,7 +441,13 @@ impl L2BridgeHandlerOps for L2ExecutionLayer {
                 .slot
         };
 
-        Ok(Some((message, slot)))
+        // Extract msgHash from MessageSent event topic[1]
+        let msg_hash = bridge_logs
+            .first()
+            .and_then(|log| log.topics().get(1).copied())
+            .ok_or_else(|| anyhow::anyhow!("No msgHash in MessageSent topic"))?;
+
+        Ok(Some((message, slot, msg_hash)))
     }
 
     async fn get_hop_proof(

@@ -71,6 +71,7 @@ pub struct UserOp {
 // Data required to build the L1 call transaction initiated by an L2 contract via the bridge
 #[derive(Clone, Debug)]
 pub struct L1Call {
+    pub msg_hash: alloy::primitives::FixedBytes<32>,
     pub message_from_l2: Message,
     pub signal_slot_proof: Bytes,
 }
@@ -352,7 +353,7 @@ impl BridgeHandler {
     ) -> Result<Option<L1Call>, anyhow::Error> {
         let l2_el = self.taiko.l2_execution_layer();
 
-        if let Some((message_from_l2, signal_slot)) =
+        if let Some((message_from_l2, signal_slot, msg_hash)) =
             l2_el.find_message_and_signal_slot(block_id).await?
         {
             let signal_slot_proof = l2_el
@@ -360,6 +361,7 @@ impl BridgeHandler {
                 .await?;
 
             return Ok(Some(L1Call {
+                msg_hash,
                 message_from_l2,
                 signal_slot_proof,
             }));

@@ -10,7 +10,7 @@ use crate::shared_abi::bindings::{
 use crate::{l1::config::ContractAddresses, node::proposal_manager::bridge_handler::UserOp};
 use alloy::{
     eips::{BlockId, BlockNumberOrTag},
-    primitives::{Address, B256, FixedBytes},
+    primitives::{Address, B256, Bytes, FixedBytes},
     providers::{DynProvider, ext::DebugApi},
     rpc::types::{
         TransactionRequest,
@@ -260,6 +260,178 @@ fn collect_logs_recursive(frame: &CallFrame) -> Vec<CallLogFrame> {
     logs
 }
 
+/// Extract bridge Message and signal slot from call outputs when events are unavailable
+/// (e.g. when the proxy reverts). Walks the call tree looking for sendMessage calls
+/// and extracts the filled Message from the return data.
+fn extract_bridge_from_call_outputs(frame: &CallFrame) -> Option<(Message, FixedBytes<32>)> {
+    use alloy::sol_types::SolType;
+
+    // sendMessage selector = 0x1bdb0037
+    // sendSignal selector = 0x66ca2bc0
+    let send_message_sel = [0x1bu8, 0xdb, 0x00, 0x37];
+    let send_signal_sel = [0x66u8, 0xca, 0x2b, 0xc0];
+
+    let mut message: Option<Message> = None;
+    let mut slot: Option<FixedBytes<32>> = None;
+
+    fn walk(
+        frame: &CallFrame,
+        send_message_sel: &[u8; 4],
+        send_signal_sel: &[u8; 4],
+        message: &mut Option<Message>,
+        slot: &mut Option<FixedBytes<32>>,
+    ) {
+        let input = frame.input.as_ref();
+        let output = frame.output.as_deref();
+
+        // Check if this is a sendMessage CALL (not delegatecall)
+        let is_call = frame.typ.as_str() == "CALL";
+        if is_call && input.len() >= 4 && &input[..4] == send_message_sel {
+            if let Some(out) = output {
+                // sendMessage returns (bytes32 msgHash, Message memory message_)
+                // Layout: [0..32] msgHash, [32..64] offset=0x40, [64..] Message ABI tuple
+                if out.len() > 96 {
+                    // Manual parsing: sendMessage returns (bytes32, Message)
+                    // Message starts at offset 64 (0x40) in the output.
+                    // Parse each field as a 32-byte word.
+                    let msg_start = 64usize;
+                    let word = |i: usize| -> [u8; 32] {
+                        let start = msg_start + i * 32;
+                        if start + 32 <= out.len() {
+                            out[start..start + 32].try_into().unwrap_or([0u8; 32])
+                        } else {
+                            [0u8; 32]
+                        }
+                    };
+                    let u64_from = |w: [u8; 32]| -> u64 {
+                        u64::from_be_bytes(w[24..32].try_into().unwrap_or([0u8; 8]))
+                    };
+                    let u32_from = |w: [u8; 32]| -> u32 {
+                        u32::from_be_bytes(w[28..32].try_into().unwrap_or([0u8; 4]))
+                    };
+                    let addr_from = |w: [u8; 32]| -> Address {
+                        Address::from_slice(&w[12..32])
+                    };
+
+                    let id = u64_from(word(0));
+                    let fee = u64_from(word(1));
+                    let gas_limit = u32_from(word(2));
+                    let from = addr_from(word(3));
+                    let src_chain_id = u64_from(word(4));
+                    let src_owner = addr_from(word(5));
+                    let dest_chain_id = u64_from(word(6));
+                    let dest_owner = addr_from(word(7));
+                    let to = addr_from(word(8));
+                    let value = alloy::primitives::U256::from_be_bytes(word(9));
+                    // word(10) = offset to bytes data (relative to msg_start)
+                    let data_offset = u64_from(word(10)) as usize;
+                    let data_len_pos = msg_start + data_offset;
+                    let data = if data_len_pos + 32 <= out.len() {
+                        let data_len = u64_from(
+                            out[data_len_pos..data_len_pos + 32].try_into().unwrap_or([0u8; 32])
+                        ) as usize;
+                        let data_start = data_len_pos + 32;
+                        if data_start + data_len <= out.len() {
+                            Bytes::copy_from_slice(&out[data_start..data_start + data_len])
+                        } else {
+                            Bytes::new()
+                        }
+                    } else {
+                        Bytes::new()
+                    };
+
+                    let msg = Message {
+                        id, fee, gasLimit: gas_limit, from, srcChainId: src_chain_id,
+                        srcOwner: src_owner, destChainId: dest_chain_id,
+                        destOwner: dest_owner, to, value, data,
+                    };
+                    tracing::info!(
+                        "Extracted bridge message from sendMessage output: id={}, to={}, data_len={}",
+                        msg.id, msg.to, msg.data.len()
+                    );
+                    *message = Some(msg);
+                }
+            }
+        }
+
+        // Check if this is a sendSignal call
+        if input.len() >= 4 && &input[..4] == send_signal_sel {
+            if let Some(out) = output {
+                // sendSignal returns bytes32 (the slot)
+                if out.len() >= 32 {
+                    let mut slot_bytes = [0u8; 32];
+                    slot_bytes.copy_from_slice(&out[..32]);
+                    *slot = Some(FixedBytes::from(slot_bytes));
+                }
+            }
+        }
+
+        // Recurse into subcalls
+        for sub in &frame.calls {
+            walk(sub, send_message_sel, send_signal_sel, message, slot);
+        }
+    }
+
+    walk(frame, &send_message_sel, &send_signal_sel, &mut message, &mut slot);
+
+    if let (Some(m), Some(s)) = (message, slot) {
+        Some((m, s))
+    } else {
+        None
+    }
+}
+
+/// If calldata starts with Safe's execTransaction selector (0x6a761202),
+/// extract the inner (to, data) so we can trace the proxy directly.
+/// Otherwise return the original submitter + calldata unchanged.
+fn extract_exec_transaction_inner(submitter: Address, calldata: &Bytes) -> (Address, Bytes) {
+    // execTransaction selector = 0x6a761202
+    if calldata.len() >= 4 && calldata[..4] == [0x6a, 0x76, 0x12, 0x02] {
+        // ABI: execTransaction(address to, uint256 value, bytes data, ...)
+        // to is at offset 4..36 (right-padded address in 32 bytes)
+        // data is dynamic: offset at 4+64..4+96, then length+content at that offset
+        if calldata.len() >= 4 + 3 * 32 {
+            // Extract 'to' (first param, address in last 20 bytes of 32-byte word)
+            let to_bytes: [u8; 20] = calldata[4 + 12..4 + 32].try_into().unwrap_or([0u8; 20]);
+            let inner_to = Address::from(to_bytes);
+
+            // Extract 'data' (third param, dynamic bytes)
+            // Offset to data is at position 4 + 64..4 + 96
+            if calldata.len() >= 4 + 96 {
+                let data_offset_bytes: [u8; 32] = calldata[4 + 64..4 + 96]
+                    .try_into()
+                    .unwrap_or([0u8; 32]);
+                let data_offset =
+                    u64::from_be_bytes(data_offset_bytes[24..32].try_into().unwrap_or([0u8; 8]))
+                        as usize;
+                let abs_offset = 4 + data_offset;
+
+                if calldata.len() >= abs_offset + 32 {
+                    let data_len_bytes: [u8; 32] = calldata[abs_offset..abs_offset + 32]
+                        .try_into()
+                        .unwrap_or([0u8; 32]);
+                    let data_len = u64::from_be_bytes(
+                        data_len_bytes[24..32].try_into().unwrap_or([0u8; 8]),
+                    ) as usize;
+                    let data_start = abs_offset + 32;
+
+                    if calldata.len() >= data_start + data_len {
+                        let inner_data = Bytes::copy_from_slice(&calldata[data_start..data_start + data_len]);
+                        tracing::info!(
+                            "Extracted inner call from execTransaction: to={}, data_len={}",
+                            inner_to,
+                            data_len
+                        );
+                        return (inner_to, inner_data);
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: trace the original call
+    (submitter, calldata.clone())
+}
+
 pub trait L1BridgeHandlerOps {
     async fn find_message_and_signal_slot(
         &self,
@@ -272,10 +444,18 @@ impl L1BridgeHandlerOps for ExecutionLayer {
         &self,
         user_op_data: UserOp,
     ) -> Result<Option<(Message, FixedBytes<32>)>, anyhow::Error> {
+        // Extract inner target+calldata from Safe's execTransaction if possible.
+        // This traces the proxy directly so bridge messages are visible even if
+        // the proxy reverts (e.g. with ProofNotLoaded).
+        let (trace_to, trace_input) = extract_exec_transaction_inner(
+            user_op_data.submitter,
+            &user_op_data.calldata,
+        );
+
         let tx_request = TransactionRequest::default()
-            .from(self.preconfer_address)
-            .to(user_op_data.submitter)
-            .input(user_op_data.calldata.into());
+            .from(user_op_data.submitter)
+            .to(trace_to)
+            .input(trace_input.into());
 
         let mut tracer_config = serde_json::Map::new();
         tracer_config.insert("withLog".to_string(), serde_json::Value::Bool(true));
@@ -309,8 +489,8 @@ impl L1BridgeHandlerOps for ExecutionLayer {
         let mut message: Option<Message> = None;
         let mut slot: Option<FixedBytes<32>> = None;
 
-        if let alloy::rpc::types::trace::geth::GethTrace::CallTracer(call_frame) = trace_result {
-            let all_logs = collect_logs_recursive(&call_frame);
+        if let alloy::rpc::types::trace::geth::GethTrace::CallTracer(ref call_frame) = trace_result {
+            let all_logs = collect_logs_recursive(call_frame);
             tracing::debug!("Collected {} logs from call trace", all_logs.len());
 
             for log in all_logs {
@@ -336,6 +516,15 @@ impl L1BridgeHandlerOps for ExecutionLayer {
 
                         slot = Some(decoded.slot);
                     }
+                }
+            }
+
+            // Fallback: if no events (proxy reverted), extract from call outputs
+            if message.is_none() || slot.is_none() {
+                tracing::info!("No bridge events in logs, trying call output extraction...");
+                if let Some((m, s)) = extract_bridge_from_call_outputs(call_frame) {
+                    message = Some(m);
+                    slot = Some(s);
                 }
             }
         }
