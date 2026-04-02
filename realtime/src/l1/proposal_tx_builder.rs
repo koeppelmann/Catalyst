@@ -134,8 +134,8 @@ impl ProposalTxBuilder {
                         let (decoded_success, decoded_ret_data) = {
                             // Skip onMessageInvocation selector (4) + ABI bytes wrapper (offset 32 + length 32)
                             if msg_data.len() > 68 {
-                                let inner = &msg_data[68..]; // abi.encode(callId, success, retData, l1Origin)
-                                // callId at [0..32], success at [32..64], retData offset at [64..96], l1Origin at [96..128]
+                                let inner = &msg_data[68..]; // abi.encode(callId, success, retData, outboundMsgHash)
+                                // callId at [0..32], success at [32..64], retData offset at [64..96], outboundMsgHash at [96..128]
                                 if inner.len() >= 96 {
                                     let success_word = inner[32..64].iter().any(|&b| b != 0);
                                     let data_offset = u64::from_be_bytes(
